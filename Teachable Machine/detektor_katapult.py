@@ -51,7 +51,8 @@ GEMINI_MAX_WAIT     = 8.0    # ak Gemini kontrola trva dlhsie, zahod ju (aby sa 
 
 # --- Gemini potvrdenie (len ostry rezim) ---
 USE_GEMINI        = True
-GEMINI_MODEL      = "gemini-2.5-flash"
+GEMINI_MODEL      = "gemini-2.5-flash-lite"   # rychlejsi; pre vyssiu presnost: "gemini-2.5-flash"
+GEMINI_MAX_SIDE   = 384       # zmensi obrazok pred poslanim do AI (mensie = rychlejsie)
 FALLBACK_ON_ERROR = True
 
 # --- micro:bit ---
@@ -64,7 +65,8 @@ RESET_ON_START = True
 
 ALWAYS_SELECT_ROI = True
 ROI_FILE = "roi.txt"
-REF_FILE = "referencia_pokoj.jpg"
+REF_LOADED_FILE = "referencia_nabity.jpg"     # ukazka: katapult NABITY  (klaves r)
+REF_FIRED_FILE  = "referencia_vystrel.jpg"    # ukazka: katapult VYSTRELENY (klaves f)
 
 
 def _load_key(env_name, filename):
@@ -136,17 +138,34 @@ def send_reset(ser):
 # ---------- Gemini (len ostry rezim, na pozadi) ----------
 _gemini_client = None
 _pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-_ref_jpg = None
+_ref_loaded = None   # ukazka: katapult NABITY  (klaves r)
+_ref_fired = None    # ukazka: katapult VYSTRELENY (klaves f)
 
-PROMPT_REF = (
-    "Prvy obrazok = katapult NABITY (referencia). Druhy obrazok = aktualny zaber po pohybe. "
-    "Vystrelil prave KATAPULT (rameno sa vymrstilo / zmenilo polohu oproti referencii)? "
+PROMPT_BOTH = (
+    "Obrazok 1 = TENTO katapult v stave NABITY. Obrazok 2 = TENTO katapult VYSTRELENY. "
+    "Obrazok 3 = aktualny zaber. Vystrelil prave tento katapult na obrazku 3 "
+    "(teda vyzera ako obrazok 2, nie ako obrazok 1)? Ignoruj ludi a ine predmety. "
+    "Odpovedz IBA jednym slovom: ANO alebo NIE."
+)
+PROMPT_LOADED = (
+    "Obrazok 1 = TENTO katapult NABITY (referencia). Obrazok 2 = aktualny zaber po pohybe. "
+    "Vystrelil katapult (rameno sa vymrstilo / zmenilo polohu oproti referencii)? "
     "Ignoruj ludi a pozadie. Odpovedz IBA jednym slovom: ANO alebo NIE."
 )
-PROMPT_NOREF = (
+PROMPT_NONE = (
     "Na obrazku je katapult tesne po pohybe. Vystrelil prave KATAPULT (rameno sa vymrstilo)? "
     "Ak je to len clovek/predmet, odpovedz NIE. Odpovedz IBA jednym slovom: ANO alebo NIE."
 )
+
+
+def _jpeg(roi_bgr, max_side=GEMINI_MAX_SIDE, q=85):
+    """Zmensi (kvoli rychlosti) a zakoduj do JPEG -> bytes alebo None."""
+    h, w = roi_bgr.shape[:2]
+    if max(h, w) > max_side:
+        s = max_side / float(max(h, w))
+        roi_bgr = cv2.resize(roi_bgr, (max(1, int(w * s)), max(1, int(h * s))))
+    ok, buf = cv2.imencode(".jpg", roi_bgr, [cv2.IMWRITE_JPEG_QUALITY, q])
+    return buf.tobytes() if ok else None
 
 
 def init_gemini():
@@ -165,7 +184,7 @@ def init_gemini():
 
 
 def confirm_job(roi_bgr):
-    """Bezi NA POZADI. Vrati True ak Gemini potvrdi vystrel."""
+    """Bezi NA POZADI. Vrati True ak Gemini potvrdi vystrel. Pouzije ukazky katapultu (referencie)."""
     if _gemini_client is None:
         return FALLBACK_ON_ERROR
     try:
@@ -173,14 +192,20 @@ def confirm_job(roi_bgr):
         from google.genai import errors as gerr
     except Exception:
         return FALLBACK_ON_ERROR
-    ok, buf = cv2.imencode(".jpg", roi_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    if not ok:
+    cur = _jpeg(roi_bgr)
+    if cur is None:
         return FALLBACK_ON_ERROR
-    cur = types.Part.from_bytes(data=buf.tobytes(), mime_type="image/jpeg")
-    if _ref_jpg is not None:
-        contents = [types.Part.from_bytes(data=_ref_jpg, mime_type="image/jpeg"), cur, PROMPT_REF]
+
+    def img(b):
+        return types.Part.from_bytes(data=b, mime_type="image/jpeg")
+
+    if _ref_loaded is not None and _ref_fired is not None:
+        contents = [img(_ref_loaded), img(_ref_fired), img(cur), PROMPT_BOTH]
+    elif _ref_loaded is not None:
+        contents = [img(_ref_loaded), img(cur), PROMPT_LOADED]
     else:
-        contents = [cur, PROMPT_NOREF]
+        contents = [img(cur), PROMPT_NONE]
+
     for _ in range(2):
         try:
             r = _gemini_client.models.generate_content(model=GEMINI_MODEL, contents=contents)
@@ -201,23 +226,37 @@ def confirm_job(roi_bgr):
     return FALLBACK_ON_ERROR
 
 
-# ---------- referencia ----------
-def load_reference():
-    global _ref_jpg
-    if os.path.exists(REF_FILE):
-        with open(REF_FILE, "rb") as f:
-            _ref_jpg = f.read()
-        print(f"[referencia] nacitana zo suboru {REF_FILE}")
+# ---------- referencie (ukazky katapultu pre Gemini) ----------
+def load_references():
+    global _ref_loaded, _ref_fired
+    if os.path.exists(REF_LOADED_FILE):
+        with open(REF_LOADED_FILE, "rb") as f:
+            _ref_loaded = f.read()
+        print("[referencia] nacitany NABITY")
+    if os.path.exists(REF_FIRED_FILE):
+        with open(REF_FIRED_FILE, "rb") as f:
+            _ref_fired = f.read()
+        print("[referencia] nacitany VYSTRELENY")
 
 
-def save_reference(roi_bgr):
-    global _ref_jpg
-    ok, buf = cv2.imencode(".jpg", roi_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    if ok:
-        _ref_jpg = buf.tobytes()
-        with open(REF_FILE, "wb") as f:
-            f.write(_ref_jpg)
-        print("[referencia] ULOZENA (NABITY katapult)")
+def save_reference_loaded(roi_bgr):
+    global _ref_loaded
+    jpg = _jpeg(roi_bgr)
+    if jpg is not None:
+        _ref_loaded = jpg
+        with open(REF_LOADED_FILE, "wb") as f:
+            f.write(jpg)
+        print("[referencia] ULOZENY NABITY katapult (r)")
+
+
+def save_reference_fired(roi_bgr):
+    global _ref_fired
+    jpg = _jpeg(roi_bgr)
+    if jpg is not None:
+        _ref_fired = jpg
+        with open(REF_FIRED_FILE, "wb") as f:
+            f.write(jpg)
+        print("[referencia] ULOZENY VYSTRELENY katapult (f)")
 
 
 # ---------- ROI subor ----------
@@ -296,6 +335,7 @@ class CameraStream:
 # ---------- hlavna slucka ----------
 def main():
     init_gemini()
+    load_references()
     ser = init_serial()
     if RESET_ON_START:
         send_reset(ser)
@@ -340,7 +380,6 @@ def main():
         saved = load_saved_roi(aw, ah)
         if saved:
             sel["roi"] = saved
-            load_reference()
 
     def on_mouse(event, x, y, flags, param):
         fx = max(0, min(aw - 1, int(x / display_scale)))
@@ -544,7 +583,8 @@ def main():
         btn2_label = ("POZASTAVENE" if paused else "BEZI") + "  (klik / P)"
         cv2.putText(frame, btn2_label, (btn2_x0 + 10, btn2_y0 + 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-        ref_txt = "referencia: ULOZENA" if _ref_jpg is not None else "referencia: ziadna (nepovinna, 'r')"
+        ref_txt = (f"ukazky: nabity={'ANO' if _ref_loaded is not None else 'nie'}  "
+                   f"vystrel={'ANO' if _ref_fired is not None else 'nie'}   (r=nabity, f=vystrel)")
         cv2.putText(frame, ref_txt, (10, ah - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
@@ -555,7 +595,10 @@ def main():
             break
         elif key == ord("r") and active_roi is not None:
             rx, ry, rw, rh = active_roi
-            save_reference(frame[ry:ry + rh, rx:rx + rw].copy())
+            save_reference_loaded(frame[ry:ry + rh, rx:rx + rw].copy())
+        elif key == ord("f") and active_roi is not None:
+            rx, ry, rw, rh = active_roi
+            save_reference_fired(frame[ry:ry + rh, rx:rx + rw].copy())
         elif key == ord("x"):
             send_reset(ser)
         elif key == ord("m"):
