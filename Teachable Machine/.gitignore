@@ -1,0 +1,7 @@
+# tajny API kluc - nikdy nezverejnovat
+gemini_key.txt
+# ulozeny vyber vyrezu
+roi.txt
+# python
+__pycache__/
+*.pyc
